@@ -1,0 +1,297 @@
+# TCGA RNA-seq (log2 CPM) + PROMOTER methylation analysis
+
+# ============================================================
+# 0. Bioconductor setup 
+# ============================================================
+
+if (!requireNamespace("BiocManager", quietly = TRUE)) {
+  install.packages("BiocManager", type = "source")
+}
+library(BiocManager)
+
+BiocManager::install(version = "3.19", ask = FALSE, force = TRUE)
+BiocManager::version()
+
+BiocManager::install("TCGAbiolinks", ask = FALSE, update = TRUE)
+library(TCGAbiolinks)
+
+BiocManager::install(
+  c(
+    "SummarizedExperiment",
+    "IlluminaHumanMethylation450kanno.ilmn12.hg19",
+    "tidyverse",
+    "minfi",
+    "sesame",
+    "sesameData"
+  ),
+  ask = FALSE,
+  update = TRUE
+)
+
+library(SummarizedExperiment)
+library(tidyverse)
+library(minfi)
+library(IlluminaHumanMethylation450kanno.ilmn12.hg19)
+library(sesame)
+library(sesameData)
+
+Sys.setenv(SESAME_DATADIR = "~/sesame_cache")
+dir.create("~/sesame_cache", recursive = TRUE, showWarnings = FALSE)
+sesameDataCache()
+
+# ============================================================
+# 1. Parameters
+# ============================================================
+
+projects <- "TCGA-BRCA"
+genes <- c("APC", "YTHDF1", "METTL14", "SCG2", "LILRB4")
+sample_types <- c("Primary Tumor", "Metastatic")
+
+# ============================================================
+# 2. Helper 
+# ============================================================
+
+# TCGA barcode → TP / TM
+.sample_type <- function(barcodes) {
+  TCGAquery_SampleTypes(barcodes, c("TP", "TM"))
+}
+
+# ============================================================
+# 3. PROMOTER-only Illumina 450k annotation
+# ============================================================
+
+anno_450k <- {
+  a <- minfi::getAnnotation(IlluminaHumanMethylation450kanno.ilmn12.hg19)
+  
+  tibble(
+    probe = rownames(a),
+    gene_symbol = as.character(a$UCSC_RefGene_Name),
+    gene_group  = as.character(a$UCSC_RefGene_Group)
+  ) |>
+    filter(
+      !is.na(gene_symbol),
+      gene_symbol != "",
+      gene_group %in% c("TSS200", "TSS1500", "5'UTR", "1stExon")
+    ) |>
+    mutate(gene_symbol = strsplit(gene_symbol, ";|,")) |>
+    unnest(gene_symbol) |>
+    mutate(gene_symbol = str_trim(gene_symbol)) |>
+    distinct(probe, gene_symbol)
+}
+
+probes_of_interest <- anno_450k |>
+  filter(gene_symbol %in% genes) |>
+  pull(probe) |>
+  unique()
+
+# ============================================================
+# 4. RNA-seq helper (log2 CPM normalization)
+# ============================================================
+
+extract_counts_for_genes <- function(se, gene_set) {
+  
+  rd <- as.data.frame(rowData(se))
+  gcol <- intersect(c("gene_name", "external_gene_name", "symbol"), colnames(rd))
+  gcol <- gcol[1]
+  
+  keep <- rd[[gcol]] %in% gene_set
+  if (!any(keep)) return(tibble())
+  
+  counts <- assay(se)[keep, , drop = FALSE]
+  
+  # CPM normalization
+  lib_sizes <- colSums(assay(se))
+  cpm <- t(t(counts) / lib_sizes * 1e6)
+  log2_cpm <- log2(cpm + 1)
+  
+  as_tibble(log2_cpm, rownames = "row") |>
+    mutate(gene = rd[[gcol]][keep]) |>
+    select(-row) |>
+    pivot_longer(
+      -gene,
+      names_to = "barcode",
+      values_to = "value"
+    )
+}
+
+# ============================================================
+# 5. MAIN ANALYSIS
+# ============================================================
+
+final_results <- map_dfr(projects, function(prj) {
+  
+  message("== Project: ", prj, " ==")
+  
+  # ---------------- RNA-seq ----------------
+  q_expr <- GDCquery(
+    project = prj,
+    data.category = "Transcriptome Profiling",
+    data.type = "Gene Expression Quantification",
+    workflow.type = "STAR - Counts",
+    sample.type = sample_types
+  )
+  
+  GDCdownload(q_expr, directory = "GDCdata", method = "api", files.per.chunk = 20)
+  se_expr <- GDCprepare(q_expr, summarizedExperiment = TRUE)
+  
+  expr_tbl <- extract_counts_for_genes(se_expr, genes)
+  
+  sample_map_expr <- tibble(
+    barcode = unique(expr_tbl$barcode),
+    sample_type = .sample_type(unique(expr_tbl$barcode))
+  )
+  
+  expr_tbl <- expr_tbl |>
+    left_join(sample_map_expr, by = "barcode") |>
+    mutate(
+      project = prj,
+      omic = "RNAseq",
+      measure = "log2CPM"
+    )
+  
+  rm(se_expr); gc(FALSE)
+  
+  # ---------------- DNA methylation ----------------
+  q_met <- GDCquery(
+    project = prj,
+    data.category = "DNA Methylation",
+    data.type = "Methylation Beta Value",
+    platform = "Illumina Human Methylation 450",
+    sample.type = sample_types
+  )
+  
+  GDCdownload(q_met, directory = "GDCdata", method = "api", files.per.chunk = 20)
+  
+  beta_mat <- GDCprepare(q_met, summarizedExperiment = FALSE)
+  
+  keep_probes <- intersect(rownames(beta_mat), probes_of_interest)
+  beta_mat <- beta_mat[keep_probes, , drop = FALSE]
+  
+  anno_sub <- anno_450k |>
+    filter(probe %in% keep_probes, gene_symbol %in% genes)
+  
+  probe_sets <- split(anno_sub$probe, anno_sub$gene_symbol)
+  
+  met_mat <- sapply(probe_sets, function(p) {
+    if (length(p) == 1) {
+      beta_mat[p, ]
+    } else {
+      colMeans(beta_mat[p, , drop = FALSE], na.rm = TRUE)
+    }
+  })
+  
+  met_tbl <- as_tibble(met_mat, rownames = "barcode") |>
+    pivot_longer(-barcode, names_to = "gene", values_to = "value")
+  
+  sample_map_met <- tibble(
+    barcode = unique(met_tbl$barcode),
+    sample_type = .sample_type(unique(met_tbl$barcode))
+  )
+  
+  met_tbl <- met_tbl |>
+    left_join(sample_map_met, by = "barcode") |>
+    mutate(
+      project = prj,
+      omic = "Methylation",
+      measure = "promoter_beta"
+    )
+  
+  rm(beta_mat, met_mat); gc(FALSE)
+  
+  # ---------------- combine ----------------
+  bind_rows(expr_tbl, met_tbl)
+})
+
+# ============================================================
+# 6. Expression–methylation correlation for ALL genes
+# ============================================================
+
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+
+# Prepare paired data at SAMPLE level
+paired_long <- final_results |>
+  mutate(
+    # Harmonize TCGA barcodes to sample-level (TCGA-XX-YYYY-01A)
+    sample_id = substr(barcode, 1, 16)
+  ) |>
+  select(sample_id, gene, omic, value)
+
+# Collapse technical duplicates (one value per sample × gene × omic)
+paired_collapsed <- paired_long |>
+  group_by(sample_id, gene, omic) |>
+  summarize(
+    value = mean(value, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# Pivot to wide format (RNAseq vs Methylation)
+paired_wide <- paired_collapsed |>
+  pivot_wider(
+    names_from  = omic,
+    values_from = value
+  )
+
+# Keep only paired RNAseq + Methylation samples
+paired_complete <- paired_wide |>
+  filter(
+    !is.na(RNAseq),
+    !is.na(Methylation)
+  )
+
+# Correlation per gene (Spearman)
+gene_correlations <- paired_complete |>
+  group_by(gene) |>
+  summarize(
+    n_paired = n(),
+    spearman_rho = cor(RNAseq, Methylation, method = "spearman"),
+    p_value = cor.test(RNAseq, Methylation, method = "spearman")$p.value,
+    .groups = "drop"
+  ) |>
+  mutate(
+    fdr = p.adjust(p_value, method = "BH")
+  ) |>
+  arrange(desc(abs(spearman_rho)))
+
+gene_correlations
+
+# Quick summaries
+
+# Top correlations by effect size
+gene_correlations |> slice_max(abs(spearman_rho), n = 10)
+
+# Statistically significant correlations (if any)
+gene_correlations |> filter(fdr < 0.05)
+
+# Volcano-style diagnostic plot (all genes)
+ggplot(gene_correlations,
+       aes(x = spearman_rho, y = -log10(fdr))) +
+  geom_point(alpha = 0.7) +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  labs(
+    title = "Expression–promoter methylation correlation (TCGA-BRCA)",
+    x = "Spearman correlation (RNAseq vs promoter methylation)",
+    y = "-log10(FDR)"
+  )
+
+# Scatterplot for individual genes
+plot_gene <- function(gene_name) {
+  paired_complete |>
+    filter(gene == gene_name) |>
+    ggplot(aes(x = Methylation, y = RNAseq)) +
+    geom_point(alpha = 0.6) +
+    geom_smooth(method = "lm", se = FALSE) +
+    labs(
+      title = paste0(gene_name,
+                     ": expression vs promoter methylation (TCGA-BRCA)"),
+      x = "Promoter methylation (mean beta)",
+      y = "RNA-seq expression (log2 CPM)"
+    )
+}
+
+# Example plots
+plot_gene("APC")
+plot_gene("YTHDF1")
+plot_gene("METTL14")
+plot_gene("LILRB4")
