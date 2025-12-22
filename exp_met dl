@@ -171,7 +171,7 @@ head(final_results)
 saveRDS(final_results, "final_results_TCGA_BRCA.rds")
 
 # ============================================================
-# 5. PLOT
+# 5. PLOT & STATS TEST
 # ============================================================
 
 # Quick methylation boxplots for APC, YTHDF1, METTL14 (BRCA)
@@ -214,61 +214,3 @@ final_results |>
     .groups = "drop"
   )
 
-# Harmonize APC data to sample level
-apc_long <- final_results |>
-  filter(gene == "APC") |>
-  mutate(
-    # TCGA sample-level barcode (TCGA-XX-YYYY-01A)
-    sample_id = substr(barcode, 1, 16)
-  ) |>
-  select(sample_id, omic, value)
-
-# Resolve duplicate measurements per sample
-apc_collapsed <- apc_long |>
-  group_by(sample_id, omic) |>
-  summarize(
-    value = mean(value, na.rm = TRUE),
-    .groups = "drop"
-  )
-
-# Inspect how many paired samples we have
-apc_wide |>
-  summarize(
-    n_total = n(),
-    n_paired = sum(complete.cases(RNAseq, Methylation))
-  )
-
-# Pivot to wide format (RNAseq vs Methylation)
-apc_wide <- apc_collapsed |>
-  pivot_wider(
-    names_from = omic,
-    values_from = value
-  )
-
-# Count paired samples
-apc_wide |>
-  summarize(
-    n_total = n(),
-    n_paired = sum(complete.cases(RNAseq, Methylation))
-  )
-
-# Correlation analysis
-apc_cor <- apc_wide |>
-  filter(complete.cases(RNAseq, Methylation)) |>
-  select(RNAseq, Methylation) |>
-  cor(method = "spearman")
-
-apc_cor
-
-# Visualization
-apc_wide |>
-  filter(complete.cases(RNAseq, Methylation)) |>
-  ggplot(aes(x = Methylation, y = RNAseq)) +
-  geom_point(alpha = 0.7) +
-  geom_smooth(method = "lm", se = FALSE) +
-  labs(
-    title = "APC expression vs methylation (TCGA-BRCA)",
-    subtitle = "Paired RNA-seq and DNA methylation samples",
-    x = "Mean gene-level methylation (beta)",
-    y = "RNA-seq counts"
-  )
