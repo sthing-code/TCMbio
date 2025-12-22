@@ -1,177 +1,125 @@
-# Install BiocManager
+# ============================================================
+# 0. Bioconductor setup 
+# ============================================================
+
 if (!requireNamespace("BiocManager", quietly = TRUE)) {
   install.packages("BiocManager", type = "source")
 }
-
 library(BiocManager)
 
-# Ensure correct Bioconductor version for R 4.4.x
 BiocManager::install(version = "3.19", ask = FALSE, force = TRUE)
 BiocManager::version()
 
-# Install TCGAbiolinks
 BiocManager::install("TCGAbiolinks", ask = FALSE, update = TRUE)
 library(TCGAbiolinks)
 
-# Install required packages
-BiocManager::install(c("SummarizedExperiment", 
-                       "ComplexHeatmap", 
-                       "IlluminaHumanMethylation450kanno.ilmn12.hg19", 
-                       "tidyverse", 
-                       "minfi",
-                       "sesame",
-                       "sesameData"), 
-                     ask=FALSE,
-                     update = TRUE,
-                     force = TRUE)
-
-Sys.setenv(SESAME_DATADIR = "~/sesame_cache")
-dir.create("~/sesame_cache", recursive = TRUE, showWarnings = FALSE)
+BiocManager::install(
+  c(
+    "SummarizedExperiment",
+    "IlluminaHumanMethylation450kanno.ilmn12.hg19",
+    "tidyverse",
+    "minfi",
+    "sesame",
+    "sesameData"
+  ),
+  ask = FALSE,
+  update = TRUE
+)
 
 library(SummarizedExperiment)
-library(ComplexHeatmap)
 library(tidyverse)
-library(minfi) # for 450k probe annotations
-library(IlluminaHumanMethylation450kanno.ilmn12.hg19) # for mapping
+library(minfi)
+library(IlluminaHumanMethylation450kanno.ilmn12.hg19)
 library(sesame)
 library(sesameData)
 
+Sys.setenv(SESAME_DATADIR = "~/sesame_cache")
+dir.create("~/sesame_cache", recursive = TRUE, showWarnings = FALSE)
 sesameDataCache()
 
-# ———————————————— PARAMETERS ————————————————
-projects <- c("TCGA-BRCA", "TCGA-PAAD", "TCGA-LUAD", "TCGA-LUSC", "TCGA-STAD", 
-             "TCGA-READ") 
-genes <- c("APC","YTHDF1","METTL14","SCG2","LILRB4")
+# ============================================================
+# 1. Parameters
+# ============================================================
+
+projects <- "TCGA-BRCA"
+genes <- c("APC", "YTHDF1", "METTL14", "SCG2", "LILRB4")
 sample_types <- c("Primary Tumor", "Metastatic")
 
-# ———————————————— HELPERS ————————————————
-# Extract sample type short code from barcode
+# ============================================================
+# 2. Helpers
+# ============================================================
+
 .sample_type <- function(barcodes) {
-  TCGAquery_SampleTypes(barcodes, c("TP", "TM"))
-}
-
-# Get Illumina 450k probe annotation (tells us which probes map to which genes)
-anno_450k <- {
-  # load annotation data using minfi
-  a <- minfi::getAnnotation(IlluminaHumanMethylation450kanno.ilmn12.hg19)
-  # create a table with probe IDs and gene names
-  tibble::tibble(
-    probe = rownames(a),
-    genes = as.character(a$UCSC_RefGene_Name)
-  ) |>
-    # remove probes that don’t map to any gene
-    filter(!is.na(genes), genes != "") |> 
-    # split gene names when a probe maps to multiple genes
-    mutate(gene_symbol = strsplit(genes, ";|,")) |>
-    # turn each gene into its own row
-    tidyr::unnest(gene_symbol) |> #
-    # trim off any accidental blank spaces around the names
-    mutate(gene_symbol = str_trim(gene_symbol)) |>
-    # make sure each probe–gene pair only appears once
-    distinct(probe, gene_symbol)
-}
-
-# Calculate average methylation per gene for each sample
-summarize_beta_by_gene <- function(beta_mat, gene_set) {
-  # keep only probes that are in both beta matrix and annotation
-  common_probes <- intersect(rownames(beta_mat), anno_450k$probe)
-  if (length(common_probes) == 0) return(tibble())
-  
-  # keep only probes that match the genes of interest
-  anno_sub <- anno_450k |>
-    filter(probe %in% common_probes, gene_symbol %in% gene_set)
-  
-  # if no probes matched the gene list, stop
-  if (nrow(anno_sub) == 0) {
-    warning("No 450k probes mapped to the requested genes in this cohort.")
-    return(tibble())
-  }
-  
-  # get beta values just for the probes we care about
-  beta_df <- as.data.frame(beta_mat[anno_sub$probe, , drop = FALSE])
-  beta_df$probe <- rownames(beta_df)
-  
-  # turn table into long format: one row per sample-probe pair
-  beta_long <- beta_df |>
-    as_tibble() |>
-    pivot_longer(-probe, names_to = "barcode", values_to = "beta")
-  
-  # add gene names to each probe, then average beta per gene per sample
-  beta_long |>
-    left_join(anno_sub, by = c("probe" = "probe")) |>
-    group_by(barcode, gene_symbol) |>
-    summarize(mean_beta = mean(beta, na.rm = TRUE), .groups = "drop") |>
-    rename(gene = gene_symbol)
-}
-
-# Extract RNA-seq counts for selected genes (by gene_symbol)
-extract_counts_for_genes <- function(se, gene_set) {
-  rd <- as.data.frame(SummarizedExperiment::rowData(se))
-  # look for the column that holds gene names
-  gcol <- intersect(c("gene_name","external_gene_name","symbol"), colnames(rd))
-  stopifnot(length(gcol) >= 1) # stop if no matching column found
-  gcol <- gcol[1] # pick the first match
-  
-  # keep only genes in the list
-  keep <- rd[[gcol]] %in% gene_set
-  if (!any(keep)) return(tibble())
-  # get expression counts
-  counts <- as.matrix(SummarizedExperiment::assay(se))
-  sub <- counts[keep, , drop = FALSE]
-  
-  # turn to long format table
-  tibble::as_tibble(sub, rownames = "row_id") |>
-    mutate(gene = rd[[gcol]][keep]) |>
-    relocate(gene) |>
-    select(-row_id) |>
-    pivot_longer(-gene, names_to = "barcode", values_to = "counts")
-}
-
-# Clean sample metadata
-sample_metadata <- function(se) {
-  # pull out sample info (colData = info about columns/samples)
-  cd <- as.data.frame(SummarizedExperiment::colData(se))
-  # create table
-  tibble(
-    barcode = rownames(cd),
-    # use project_id if it exists, otherwise try project; neither, use NA
-    project = cd$project_id %||% cd$project %||% NA_character_,
-    # use short_letter_code if available, otherwise sample_type
-    sample_type = cd$short_letter_code %||% cd$sample_type %||% NA_character_
+  code <- substr(barcodes, 14, 15)
+  case_when(
+    code == "01" ~ "Primary Tumor",
+    code == "06" ~ "Metastatic",
+    TRUE ~ NA_character_
   )
 }
 
-# custom operator: returns x if not null, otherwise y
-`%||%` <- function(x, y) if (!is.null(x)) x else y
+# 450k annotation (once)
+anno_450k <- {
+  a <- minfi::getAnnotation(IlluminaHumanMethylation450kanno.ilmn12.hg19)
+  tibble(
+    probe = rownames(a),
+    gene_symbol = strsplit(as.character(a$UCSC_RefGene_Name), ";|,")
+  ) |>
+    unnest(gene_symbol) |>
+    mutate(gene_symbol = str_trim(gene_symbol)) |>
+    filter(gene_symbol %in% genes) |>
+    distinct()
+}
 
-# ———————————————— QUERY ————————————————
-# Loop through each project
-results <- map_dfr(projects, function(prj) {
+probes_of_interest <- unique(anno_450k$probe)
+
+# RNA-seq extractor
+extract_counts_for_genes <- function(se, gene_set) {
+  rd <- as.data.frame(rowData(se))
+  gcol <- intersect(c("gene_name", "external_gene_name", "symbol"), colnames(rd))[1]
+  
+  keep <- rd[[gcol]] %in% gene_set
+  counts <- assay(se)[keep, , drop = FALSE]
+  
+  as_tibble(counts, rownames = "gene") |>
+    mutate(gene = rd[[gcol]][keep]) |>
+    pivot_longer(-gene, names_to = "barcode", values_to = "counts")
+}
+
+# ============================================================
+# 3. MAIN ANALYSIS 
+# ============================================================
+
+final_results <- purrr::map_dfr(projects, function(prj) {
+  
   message("== Project: ", prj, " ==")
   
-  ## 1) RNA-seq (STAR - Counts)
+  # ---------- RNA-seq ----------
   q_expr <- GDCquery(
     project = prj,
     data.category = "Transcriptome Profiling",
     data.type = "Gene Expression Quantification",
-    workflow.type = "STAR - Counts", # for raw counts
+    workflow.type = "STAR - Counts",
     sample.type = sample_types
   )
-  GDCdownload(q_expr, method = "api", files.per.chunk = 20)
-  se_expr <- GDCprepare(q_expr)
   
-  # get expression counts
-  expr_tbl <- extract_counts_for_genes(se_expr, genes)
-  # get sample metadata
-  meta_expr <- sample_metadata(se_expr)
+  GDCdownload(q_expr, directory = "GDCdata", method = "api")
   
-  # combine expression + metadata
-  expr_tbl <- expr_tbl |>
-    left_join(meta_expr, by = "barcode") |> # add tumour type, project info
-    mutate(project = coalesce(project, prj),  
-           omic = "RNAseq")
+  se_expr <- GDCprepare(q_expr, summarizedExperiment = TRUE)
   
-  ## 2) DNA methylation (450K)
+  expr_tbl <- extract_counts_for_genes(se_expr, genes) |>
+    mutate(
+      sample_type = .sample_type(barcode),
+      project = prj,
+      omic = "RNAseq",
+      measure = "counts",
+      value = counts
+    ) |>
+    select(barcode, gene, value, measure, omic, project, sample_type)
+  
+  rm(se_expr); gc(FALSE)
+  
+  # ---------- DNA methylation ----------
   q_met <- GDCquery(
     project = prj,
     data.category = "DNA Methylation",
@@ -179,24 +127,43 @@ results <- map_dfr(projects, function(prj) {
     platform = "Illumina Human Methylation 450",
     sample.type = sample_types
   )
-  GDCdownload(q_met, method = "api", files.per.chunk = 20)
-  se_met <- GDCprepare(q_met)
   
-  # extract the matrix of β values (probe x samples)
-  beta_mat <- SummarizedExperiment::assay(se_met)
-  # summarise methylation: average β per gene per sample
-  met_tbl  <- summarize_beta_by_gene(beta_mat, genes)
+  GDCdownload(q_met, directory = "GDCdata", method = "api")
   
-  # add metadata 
-  meta_met <- sample_metadata(se_met)
-  met_tbl <- met_tbl |>
-    left_join(meta_met, by = "barcode") |> # add metadata to methylation values
-    mutate(project = coalesce(project, prj),
-           omic = "Methylation")
+  beta_mat <- GDCprepare(q_met, summarizedExperiment = FALSE)
   
-  # Stack RNAseq + methylation data together, long format
-  bind_rows(
-    expr_tbl |> rename(value = counts) |> mutate(measure = "counts"),
-    met_tbl  |> rename(value = mean_beta) |> mutate(measure = "mean_beta")
-  )
+  keep_probes <- intersect(rownames(beta_mat), probes_of_interest)
+  beta_mat <- beta_mat[keep_probes, , drop = FALSE]
+  
+  anno_sub <- anno_450k |>
+    filter(probe %in% keep_probes)
+  
+  probe_sets <- split(anno_sub$probe, anno_sub$gene_symbol)
+  
+  met_mat <- sapply(probe_sets, function(p) {
+    colMeans(beta_mat[p, , drop = FALSE], na.rm = TRUE)
+  })
+  
+  met_tbl <- as_tibble(met_mat, rownames = "barcode") |>
+    pivot_longer(-barcode, names_to = "gene", values_to = "value") |>
+    mutate(
+      sample_type = .sample_type(barcode),
+      project = prj,
+      omic = "Methylation",
+      measure = "mean_beta"
+    ) |>
+    select(barcode, gene, value, measure, omic, project, sample_type)
+  
+  rm(beta_mat, met_mat); gc(FALSE)
+  
+  return(bind_rows(expr_tbl, met_tbl))
 })
+
+# ============================================================
+# 4. VALIDATION
+# ============================================================
+
+nrow(final_results)
+colnames(final_results)
+table(final_results$omic, final_results$sample_type)
+head(final_results)
