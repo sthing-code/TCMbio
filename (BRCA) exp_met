@@ -290,8 +290,13 @@ plot_gene <- function(gene_name) {
     )
 }
 
-# Example plots
 plot_gene("APC")
 plot_gene("YTHDF1")
 plot_gene("METTL14")
 plot_gene("LILRB4")
+
+final_results |>
+  filter(gene == "LILRB4") |>
+  count(omic)
+
+
