@@ -292,7 +292,7 @@ ggplot(gene_correlations, aes(x = gene, y = spearman_rho)) +
   )
 
 # ============================================================
-# 8. Plot helper: scatterplot for a gene in a chosen cancer
+# 8. Scatterplot 
 # ============================================================
 
 plot_gene_project <- function(gene_name, project_name) {
